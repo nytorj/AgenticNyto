@@ -3,3 +3,6 @@ pydantic
 rich
 ruff
 black
+duckduckpy
+beautifulsoup4
+requests

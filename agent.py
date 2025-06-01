@@ -4,7 +4,8 @@ import time
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
-from rich.prompt import Prompt
+from rich.prompt import Prompt, Confirm
+from typing import Dict, List
 
 from lib.ollama_client import OllamaClient
 from lib.models import ProjectPlan, FileList, FileDetail, CodeReviewResult
@@ -16,7 +17,10 @@ from lib.prompts import (
     SENIOR_ENGINEER_AGENT_PROMPT,
     DOCUMENTATION_AGENT_PROMPT
 )
-from lib.tools import write_code_to_file, verify_code, create_docs_dir_if_not_exists
+from lib.tools import (
+    write_code_to_file, verify_code, create_docs_dir_if_not_exists,
+    search_web_duckduckgo, view_text_website_content
+)
 
 try:
     ollama_client = OllamaClient()
@@ -25,310 +29,349 @@ except Exception as e:
     ollama_client = None
 console = Console()
 
+# Global flag for __main__ to control mocking
+MOCK_OLLAMA_TOOLS_ACTIVE = False
+
+class MockOllamaClientForTools:
+    _call_counts = {}
+    _user_desc_input_for_mock = "sample project"
+    _clarification_was_processed_for_planning = False
+
+    def generate(self, prompt_str: str) -> str:
+        agent_name = "UnknownAgent"
+        stripped_prompt = prompt_str.strip()
+        # Corrected agent name detection
+        if stripped_prompt.startswith("**Role**: AI Reformat Description Agent"): agent_name = "ReformatDescriptionAgent"
+        elif stripped_prompt.startswith("**Role**: AI Planning Agent"): agent_name = "PlanningAgent"
+        elif stripped_prompt.startswith("**Role**: AI Software Engineer Agent"): agent_name = "SoftwareEngineerAgent"
+        elif stripped_prompt.startswith("**Role**: AI Coding Agent"): agent_name = "CodingAgent"
+        elif stripped_prompt.startswith("**Role**: AI Senior Engineer Agent"): agent_name = "SeniorEngineerAgent"
+        elif stripped_prompt.startswith("**Role**: AI Documentation Agent"): agent_name = "DocumentationAgent"
+        else: console.print(f"[bold red][Mock Client Warning] Agent role not detected from prompt prefix. Prompt: '{stripped_prompt[:100]}...'[/bold red]")
+
+        current_call_for_agent = self._call_counts.get(agent_name, 0) + 1
+        self._call_counts[agent_name] = current_call_for_agent
+
+        console.print(f"[italic mock]MockOllamaClient: Called for {agent_name} (Agent's call #{current_call_for_agent})[/italic mock]")
+
+        has_clarification_content = "--- User Clarification ---" in prompt_str and "User responded:" in prompt_str
+        has_tool_output_content = "--- Tool Output ---" in prompt_str
+
+        console.print(f"[italic mock]State for {agent_name}: call={current_call_for_agent}, has_clar_content={has_clarification_content}, has_tool_content={has_tool_output_content}, _clar_processed_flag={getattr(self, '_clarification_was_processed_for_planning', False)}[/italic mock]")
+
+        if agent_name == "PlanningAgent":
+            if current_call_for_agent == 1:
+                console.print(f"[italic mock]PlanningAgent: Path 1 (Call {current_call_for_agent}). Requesting clarification.[/italic mock]")
+                self._clarification_was_processed_for_planning = False
+                return json.dumps({"action": "request_user_clarification", "question": f"Mock question from PlanningAgent: What is the main goal of '{self._user_desc_input_for_mock[:20]}'?"})
+
+            elif current_call_for_agent == 2:
+                console.print(f"[italic mock]PlanningAgent: Path 2 (Call {current_call_for_agent}). Clarification received. Requesting tool.[/italic mock]")
+                self._clarification_was_processed_for_planning = True
+                return json.dumps({"action": "search_web_duckduckgo", "query": f"info on {self._user_desc_input_for_mock[:20]}"})
+
+            # Path 3: Tool output has been incorporated. Generate plan.
+            # This path is taken if has_tool_output_content is true for the incoming prompt_str.
+            elif current_call_for_agent >= 3 and has_tool_output_content:
+                tool_output_summary = "Tool output error or not parsed." # Default
+                start_marker_tool = "resulted in:\n" # This is from the prompt construction in _call_agent_interactive_loop
+                end_marker_tool = "\n--- End Tool Output ---"
+                start_idx_tool = prompt_str.find(start_marker_tool)
+                if start_idx_tool != -1:
+                    end_idx_tool = prompt_str.find(end_marker_tool, start_idx_tool)
+                    if end_idx_tool != -1:
+                        tool_output_summary = prompt_str[start_idx_tool + len(start_marker_tool) : end_idx_tool].strip()
+
+                console.print(f"[italic mock]PlanningAgent: Path 3 (Call {current_call_for_agent}). Tool output ('{tool_output_summary[:60]}...'). Generating plan.[/italic mock]")
+                # Simplified JSON to match current ProjectPlan Pydantic model in lib/models.py
+                return json.dumps({
+                    "project_description": f"Mock Plan for '{self._user_desc_input_for_mock[:20]}' (clarified, tool used: {tool_output_summary[:30]}...)",
+                    "technical_description": f"Detailed technical breakdown for '{self._user_desc_input_for_mock[:20]}' including architecture (Modular), components (CoreSim), and data models (Particle), incorporating insights from web search: {tool_output_summary}",
+                    "mermaid_diagram": "graph TD;\n    Input-->CoreSim;\n    CoreSim-->Output;"
+                })
+            else: # Fallback or unexpected state for PlanningAgent
+                 # This case might be hit if max_tool_uses is exceeded and the last agent response was a tool request.
+                 console.print(f"[italic mock]PlanningAgent: Fallback/Error Path (Call {current_call_for_agent}). Current prompt did not contain expected tool output after tool request. Generating error response or basic plan.[/italic mock]")
+                 return f"Error: PlanningAgent mock in unexpected state for call {current_call_for_agent} (has_clar_text={has_clarification_content}, has_tool_text={has_tool_output_content}, clar_flag={self._clarification_was_processed_for_planning})"
+
+        elif agent_name == "ReformatDescriptionAgent":
+             return f"Mock reformatted description of '{self._user_desc_input_for_mock[:30]}'."
+        elif agent_name == "SoftwareEngineerAgent": # For Step 3
+             return json.dumps({"files": [{"path": "src/simulation_core.py", "description":"Core CUDA simulation logic."}]})
+        elif agent_name == "CodingAgent": return "# Mock code by CodingAgent"
+        elif agent_name == "SeniorEngineerAgent": return json.dumps({"review_passed": True, "feedback": "Mock LGTM", "revised_code": None})
+        elif agent_name == "DocumentationAgent": return json.dumps({"README.md": "# Mock Readme"})
+
+        return f"Error: No specific mock response defined for {agent_name} (call #{current_call_for_agent}). This indicates an issue in mock logic or agent name detection."
+
+
+def _call_agent_interactive_loop(
+    agent_name: str,
+    prompt_template: str,
+    initial_prompt_data: Dict[str, str],
+    max_clarification_attempts: int = 1,
+    max_tool_uses_per_cycle: int = 2
+) -> str:
+    global ollama_client, console, MOCK_OLLAMA_TOOLS_ACTIVE
+
+    active_client = ollama_client
+    if MOCK_OLLAMA_TOOLS_ACTIVE:
+        if not isinstance(ollama_client, MockOllamaClientForTools):
+            console.print(f"[bold red]Warning: MOCK_OLLAMA_TOOLS_ACTIVE is True, but global ollama_client is not MockOllamaClientForTools instance. Using provided client anyway.[/bold red]")
+
+    if not active_client:
+        return f"Error: Ollama client (real or mock) not available for {agent_name}."
+
+    current_prompt_data = initial_prompt_data.copy()
+    current_prompt_data.setdefault("[[USER_CLARIFICATION]]", "")
+    current_prompt_data.setdefault("[[TOOL_OUTPUT]]", "No tool output yet.")
+    current_agent_response = f"Error: Agent {agent_name} did not produce an initial valid response."
+
+    if max_clarification_attempts > 0:
+        for clar_attempt in range(max_clarification_attempts + 1):
+            prompt_for_clar_phase = prompt_template
+            temp_prompt_data_for_clar = current_prompt_data.copy()
+            if temp_prompt_data_for_clar.get("[[TOOL_OUTPUT]]") == "No tool output yet.":
+                 temp_prompt_data_for_clar.pop("[[TOOL_OUTPUT]]", None)
+            if temp_prompt_data_for_clar.get("[[USER_CLARIFICATION]]") == "":
+                 temp_prompt_data_for_clar.pop("[[USER_CLARIFICATION]]", None)
+
+            # Add all placeholders from prompt_template that are not yet in temp_prompt_data_for_clar
+            # This ensures [[TOOL_OUTPUT]] is in the prompt if the template expects it, even if it's the first tool cycle.
+            import re
+            placeholders_in_template = re.findall(r"(\[\[[A-Z_]+\]\])", prompt_template)
+            for ph in placeholders_in_template:
+                temp_prompt_data_for_clar.setdefault(ph, "")
+
+
+            for placeholder, value in temp_prompt_data_for_clar.items():
+                if placeholder in prompt_for_clar_phase: # Only replace if placeholder exists in template
+                    prompt_for_clar_phase = prompt_for_clar_phase.replace(placeholder, str(value))
+                elif value: # If placeholder not in template but has value (e.g. dynamic like tool output), append
+                    prompt_for_clar_phase += f"\n{placeholder}:\n{str(value)}"
+
+
+            console.print(f"[italic gray]Calling {agent_name} (Clarification Phase, Attempt {clar_attempt + 1})...[/italic gray]")
+            raw_output_clar = ""
+            try: raw_output_clar = active_client.generate(prompt_for_clar_phase)
+            except Exception as e_call: return f"Error: Exception during {agent_name} call - {e_call}"
+            if raw_output_clar.startswith("Error:"): return raw_output_clar
+
+            is_clar_req = False; question = ""
+            if isinstance(raw_output_clar, str) and raw_output_clar.strip().startswith("{") and raw_output_clar.strip().endswith("}"):
+                try:
+                    potential_json = json.loads(raw_output_clar.strip())
+                    if isinstance(potential_json, dict) and potential_json.get("action") == "request_user_clarification":
+                        is_clar_req = True; question = str(potential_json.get("question","Missing question"))
+                except json.JSONDecodeError: pass
+
+            if is_clar_req:
+                if clar_attempt < max_clarification_attempts:
+                    console.print(Panel(f"{agent_name} requests clarification:\n[yellow]{question}[/yellow]",title="Agent Clarification Request",border_style="yellow"))
+                    user_resp = "No clarification provided by user (non-interactive or empty)."
+                    if console.is_interactive:
+                        user_resp_raw = Prompt.ask("Your answer", default="", console=console)
+                        if user_resp_raw.strip(): user_resp = user_resp_raw
+                    current_prompt_data["[[USER_CLARIFICATION]]"] = f"\n--- User Clarification ---\nAgent previously asked: '{question}'\nUser responded: '{user_resp}'\n--- End User Clarification ---"
+                    current_prompt_data["[[TOOL_OUTPUT]]"] = "No tool output yet."
+                    console.print(Panel(f"Resuming with: '{user_resp[:100]}...'",title="Clarification Received",border_style="green"))
+                else:
+                    console.print(f"[yellow]Max clarification attempts ({max_clarification_attempts}) for {agent_name}. Unable to resolve: '{question}'[/yellow]")
+                    return f"Error: {agent_name} still needs clarification: '{question}'"
+            else:
+                current_agent_response = raw_output_clar; break
+        else:
+            return f"Error: {agent_name} ended clarification cycle still asking questions. Last question: '{question}'" if question else current_agent_response
+    else:
+        prompt_direct = prompt_template
+        temp_prompt_data_direct = current_prompt_data.copy()
+        if temp_prompt_data_direct.get("[[TOOL_OUTPUT]]") == "No tool output yet.": temp_prompt_data_direct.pop("[[TOOL_OUTPUT]]", None)
+        if temp_prompt_data_direct.get("[[USER_CLARIFICATION]]") == "": temp_prompt_data_direct.pop("[[USER_CLARIFICATION]]", None)
+
+        import re
+        placeholders_in_template_direct = re.findall(r"(\[\[[A-Z_]+\]\])", prompt_template)
+        for ph_direct in placeholders_in_template_direct:
+            temp_prompt_data_direct.setdefault(ph_direct, "")
+
+        for placeholder, value in temp_prompt_data_direct.items():
+            if placeholder in prompt_direct:
+                prompt_direct = prompt_direct.replace(placeholder, str(value))
+            elif value:
+                 prompt_direct += f"\n{placeholder}:\n{str(value)}"
+
+        try:
+            console.print(f"[italic gray]Calling {agent_name} (Direct, no clarification cycle)...[/italic gray]")
+            current_agent_response = active_client.generate(prompt_direct)
+        except Exception as e_call: return f"Error: Exception during {agent_name} call - {e_call}"
+        if current_agent_response.startswith("Error:"): return current_agent_response
+
+    if current_agent_response.startswith("Error:"): return current_agent_response
+
+    for tool_attempt_num in range(max_tool_uses_per_cycle + 1):
+        is_tool_request = False; tool_action = None; tool_params = {}
+        if isinstance(current_agent_response, str) and current_agent_response.strip().startswith("{") and current_agent_response.strip().endswith("}"):
+            try:
+                potential_json = json.loads(current_agent_response.strip())
+                if isinstance(potential_json, dict) and "action" in potential_json:
+                    action_name = potential_json.get("action")
+                    if action_name in ["search_web_duckduckgo", "view_text_website_content"]:
+                        is_tool_request = True; tool_action = action_name; tool_params = potential_json
+            except json.JSONDecodeError: pass
+
+        if not is_tool_request: return current_agent_response
+
+        if tool_attempt_num < max_tool_uses_per_cycle:
+            tool_output_str = f"Error: Tool {tool_action} failed or params missing."
+            if tool_action == "search_web_duckduckgo" and "query" in tool_params:
+                query = str(tool_params['query'])
+                console.print(Panel(f"Agent requests Search: `{query}`", title="Agent Action: Web Search",border_style="blue"))
+                tool_output_str = search_web_duckduckgo(query)
+            elif tool_action == "view_text_website_content" and "url" in tool_params:
+                url = str(tool_params['url'])
+                console.print(Panel(f"Agent requests View URL: `{url}`", title="Agent Action: View URL",border_style="blue"))
+                tool_output_str = view_text_website_content(url)
+
+            console.print(Panel(f"Tool Output (summary):\n{tool_output_str[:200]}{'...' if len(tool_output_str)>200 else ''}", title="Tool Output", expand=False, border_style="green" if not tool_output_str.startswith("Error:") else "red"))
+            current_prompt_data["[[TOOL_OUTPUT]]"] = f"\n\n--- Tool Output ---\nPreviously, you requested action '{tool_action}' with parameters '{json.dumps(tool_params)}'. That action resulted in:\n{tool_output_str}\n--- End Tool Output ---\n"
+
+            prompt_for_next_tool_cycle = prompt_template
+            temp_prompt_data_for_tool = current_prompt_data.copy()
+            if temp_prompt_data_for_tool.get("[[USER_CLARIFICATION]]") == "": temp_prompt_data_for_tool.pop("[[USER_CLARIFICATION]]", None)
+
+            # Ensure all template placeholders are present for replacement
+            import re
+            placeholders_in_template_tool = re.findall(r"(\[\[[A-Z_]+\]\])", prompt_template)
+            for ph_tool in placeholders_in_template_tool:
+                temp_prompt_data_for_tool.setdefault(ph_tool, "")
+
+            for placeholder, value in temp_prompt_data_for_tool.items():
+                if placeholder in prompt_for_next_tool_cycle:
+                    prompt_for_next_tool_cycle = prompt_for_next_tool_cycle.replace(placeholder, str(value))
+                elif value and value != "No tool output yet." and value != "": # Append if not a default empty value
+                     prompt_for_next_tool_cycle += f"\n{placeholder}:\n{str(value)}"
+
+
+            console.print(f"[italic gray]Re-calling {agent_name} with tool output (Tool Cycle Attempt {tool_attempt_num + 1})...[/italic gray]")
+            try: current_agent_response = active_client.generate(prompt_for_next_tool_cycle)
+            except Exception as e_call: return f"Error: Exception during {agent_name} call after tool use - {e_call}"
+            if current_agent_response.startswith("Error:"): return current_agent_response
+        else:
+            console.print(f"[yellow]Max tool uses ({max_tool_uses_per_cycle}) for {agent_name} in this cycle.[/yellow]")
+            return f"Error: {agent_name} may be stuck requesting tools. Last request: {current_agent_response[:200]}"
+
+    return current_agent_response
+
 def run_project(user_description: str):
-    global ollama_client, console
+    global ollama_client, console, MOCK_OLLAMA_TOOLS_ACTIVE
+    is_mock_run = MOCK_OLLAMA_TOOLS_ACTIVE
 
-    if not ollama_client:
-        console.print("[bold yellow]Warning: Ollama client is not available. LLM-based operations will use fallbacks or be skipped.[/bold yellow]")
-
+    if not ollama_client and not is_mock_run:
+        console.print("[bold yellow]Warning: Ollama client not available and not in active mock mode.[/bold yellow]")
     console.print(f"[bold blue]Starting project generation for:[/bold blue] {user_description[:100]}...")
 
-    # Step 1: Reformat Description
+    # Step 1
     console.print("\n[bold green]Step 1: Reformatting Description...[/bold green]")
-    reformatted_description = user_description # Fallback
-    if ollama_client:
+    reformatted_description = user_description
+    if ollama_client or is_mock_run:
         try:
-            prompt_template = REFORMAT_DESCRIPTION_AGENT_PROMPT
-            prompt = prompt_template.replace("[[USER_DESCRIPTION]]", user_description)
-            raw_output = ollama_client.generate(prompt)
-            if raw_output.startswith("Error:"):
-                console.print(f"[red]ReformatDescriptionAgent Error: {raw_output}[/red]")
-            else:
-                reformatted_description = raw_output
-        except Exception as e:
-            console.print(f"[bold red]Exception during Reformat Description: {e}[/bold red]")
-    else:
-        console.print("[italic yellow]Skipped ReformatDescriptionAgent (Ollama client not available).[/italic yellow]")
+            initial_reformat_data = {"[[USER_DESCRIPTION]]": user_description}
+            raw_output_reformat = _call_agent_interactive_loop("ReformatDescriptionAgent", REFORMAT_DESCRIPTION_AGENT_PROMPT, initial_reformat_data, max_clarification_attempts=1, max_tool_uses_per_cycle=0)
+            if not raw_output_reformat.startswith("Error:") and not (isinstance(raw_output_reformat, str) and raw_output_reformat.strip().startswith("{") and "request_user_clarification" in raw_output_reformat):
+                reformatted_description = raw_output_reformat
+        except Exception as e: console.print(f"[bold red]Critical error in Reformat Step: {e}[/bold red]")
+    else: console.print("[italic yellow]Skipped ReformatDescriptionAgent.[/italic yellow]")
     console.print(Panel(reformatted_description, title="Reformatted Description", expand=False, border_style="blue"))
 
-    # Step 2: Planning
+    # Step 2
     console.print("\n[bold green]Step 2: Generating Project Plan...[/bold green]")
-    project_plan = ProjectPlan(project_description="Default Plan (Ollama N/A or Error)", technical_description="N/A", mermaid_diagram="N/A")
-    if ollama_client:
+    project_plan = ProjectPlan(project_description="Default Plan", technical_description="N/A", mermaid_diagram="N/A")
+    if ollama_client or is_mock_run:
         try:
-            prompt_template = PLANNING_AGENT_PROMPT
-            prompt = prompt_template.replace("[[USER_DESCRIPTION]]", user_description).replace("[[REFORMATTED_DESCRIPTION]]", reformatted_description)
-            raw_output = ollama_client.generate(prompt)
-            if raw_output.startswith("Error:"):
-                console.print(f"[red]PlanningAgent Error: {raw_output}[/red]")
-            else:
+            initial_plan_data = {"[[USER_DESCRIPTION]]": user_description, "[[REFORMATTED_DESCRIPTION]]": reformatted_description}
+            raw_plan_output = _call_agent_interactive_loop("PlanningAgent", PLANNING_AGENT_PROMPT, initial_plan_data, max_clarification_attempts=1, max_tool_uses_per_cycle=2)
+
+            final_output_is_action = False
+            if isinstance(raw_plan_output, str) and raw_plan_output.strip().startswith("{") and raw_plan_output.strip().endswith("}"):
                 try:
-                    json_start = raw_output.find('{'); json_end = raw_output.rfind('}') + 1
+                    potential_action = json.loads(raw_plan_output.strip())
+                    if isinstance(potential_action, dict) and potential_action.get("action") in ["request_user_clarification", "search_web_duckduckgo", "view_text_website_content"]:
+                        final_output_is_action = True
+                        console.print(f"[red]PlanningAgent ended by requesting action: {potential_action.get('action')}. Plan may be incomplete.[/red]")
+                        project_plan = ProjectPlan(project_description="Plan (Agent Stuck Requesting Action/Clarification)", technical_description=raw_plan_output, mermaid_diagram="N/A")
+                except json.JSONDecodeError: pass
+
+            if not raw_plan_output.startswith("Error:") and not final_output_is_action:
+                try:
+                    json_start = raw_plan_output.find('{'); json_end = raw_plan_output.rfind('}') + 1
                     if json_start != -1 and json_end > json_start:
-                        json_str = raw_output[json_start:json_end]
-                        project_plan = ProjectPlan(**json.loads(json_str))
+                        project_plan = ProjectPlan(**json.loads(raw_plan_output[json_start:json_end]))
                     else:
-                        console.print("[red]Could not find valid JSON in PlanningAgent output.[/red]")
-                        project_plan = ProjectPlan(project_description="Plan (Invalid JSON)", technical_description=raw_output, mermaid_diagram="N/A")
-                except json.JSONDecodeError as e_json:
-                    console.print(f"[red]PlanningAgent JSON parsing error: {e_json}[/red]")
-                    project_plan = ProjectPlan(project_description="Plan (JSON Decode Error)", technical_description=raw_output, mermaid_diagram="N/A")
-                except Exception as e_val: # Pydantic validation or other errors
-                    console.print(f"[red]PlanningAgent Pydantic model validation error: {e_val}[/red]")
-                    project_plan = ProjectPlan(project_description="Plan (Validation Error)", technical_description=raw_output, mermaid_diagram="N/A")
-        except Exception as e:
-            console.print(f"[bold red]Exception during Project Planning: {e}[/bold red]")
-    else:
-        console.print("[italic yellow]Skipped PlanningAgent (Ollama client not available).[/italic yellow]")
+                        project_plan = ProjectPlan(project_description="Plan (Raw Text, Not JSON)", technical_description=raw_plan_output, mermaid_diagram="N/A")
+                except Exception as e_parse:
+                    console.print(f"[red]Error parsing Project Plan from agent output: {e_parse}. Raw output was: {raw_plan_output[:300]}[/red]")
+                    project_plan = ProjectPlan(project_description="Plan (Parse Error on Final Output)", technical_description=raw_plan_output, mermaid_diagram="N/A")
+        except Exception as e: console.print(f"[bold red]Critical error in Planning Step: {e}[/bold red]")
+    else: console.print("[italic yellow]Skipped PlanningAgent.[/italic yellow]")
     console.print(Panel(f"Title: {project_plan.project_description}\nTech Dsc: {project_plan.technical_description[:100]}...", title="Project Plan Summary", expand=False, border_style="blue"))
 
-    # Step 3: File List Generation
-    console.print("\n[bold green]Step 3: Generating File List...[/bold green]")
+    active_ollama_for_later_steps = ollama_client
+
+    console.print("\n[bold green]Step 3: File List Generation...[/bold green]")
     file_list = FileList(files=[])
-    if ollama_client:
+    if active_ollama_for_later_steps:
         try:
-            plan_content_for_agent = project_plan.model_dump_json(indent=2)
-            prompt_template = SOFTWARE_ENGINEER_AGENT_PROMPT
-            prompt = prompt_template.replace("[[PROJECT_PLAN_CONTENT]]", plan_content_for_agent)
-            raw_output = ollama_client.generate(prompt)
-            if raw_output.startswith("Error:"):
-                console.print(f"[red]SoftwareEngineerAgent Error: {raw_output}[/red]")
-            else:
-                try:
-                    json_start = raw_output.find('{'); json_end = raw_output.rfind('}') + 1
-                    if json_start != -1 and json_end > json_start:
-                        json_str = raw_output[json_start:json_end]
-                        file_list = FileList(**json.loads(json_str))
-                    else:
-                        console.print("[red]Could not find valid JSON in SoftwareEngineerAgent output.[/red]")
-                except json.JSONDecodeError as e_json:
-                    console.print(f"[red]File List JSON parsing error: {e_json}[/red]")
-                except Exception as e_val: # Pydantic validation or other errors
-                    console.print(f"[red]File List Pydantic model validation error: {e_val}[/red]")
-        except Exception as e:
-            console.print(f"[bold red]Exception during File List Generation: {e}[/bold red]")
-    else:
-        console.print("[italic yellow]Skipped SoftwareEngineerAgent (Ollama client not available).[/italic yellow]")
-    # Ensure file_list.files is not None if file_list itself is None (though it's initialized with files=[])
-    if not hasattr(file_list, 'files') or file_list.files is None : file_list = FileList(files=[]) # Extra safety
-    console.print(Panel(f"Files to generate: {len(file_list.files)}", title="File List Summary", expand=False, border_style="blue"))
+            plan_json = project_plan.model_dump_json()
+            se_prompt = SOFTWARE_ENGINEER_AGENT_PROMPT.replace("[[PROJECT_PLAN_CONTENT]]", plan_json)
+            raw_se_output = active_ollama_for_later_steps.generate(se_prompt) # Direct call
+            if not raw_se_output.startswith("Error:"):
+                 try:
+                     json_start_se = raw_se_output.find('{'); json_end_se = raw_se_output.rfind('}') + 1
+                     if json_start_se != -1 and json_end_se > json_start_se:
+                         file_list = FileList(**json.loads(raw_se_output[json_start_se:json_end_se]))
+                     else: console.print(f"[red]SE Agent: Output not valid JSON: {raw_se_output[:100]}[/red]")
+                 except Exception as e_parse_se: console.print(f"[red]SE Agent: Failed to parse JSON output: {e_parse_se} Raw: {raw_se_output[:100]}[/red]")
+            else: console.print(f"[red]SE Agent Error: {raw_se_output}[/red]")
+        except Exception as e: console.print(f"[red]SE Agent Exception: {e}[/red]")
+    else: console.print("[italic yellow]Skipped File List Gen.[/italic yellow]")
+    console.print(Panel(f"Files to generate: {len(file_list.files)}",title="File List Summary",expand=False,border_style="blue"))
 
-    # Step 4: Code Generation & Review Loop
-    console.print("\n[bold green]Step 4: Code Generation & Review...[/bold green]")
+    console.print("\n[bold green]Step 4: Code Generation & Review... (condensed)[/bold green]")
     final_code_outputs = {}
-    # The `or True` part forces mock logic for TUI demo when ollama_client is None.
-    # Remove `or True` for actual LLM runs.
-    use_mock_logic_for_tui_demo = not ollama_client or True
+    if not file_list.files or not active_ollama_for_later_steps:
+        console.print("[yellow]Skipping Code Gen (no files or no client).[/yellow]")
+    else:
+        console.print(f"[italic gray]Simulating code generation for {len(file_list.files)} files...[/italic gray]")
+        for file_detail in file_list.files:
+            final_code_outputs[file_detail.path] = f"# Mock code for {file_detail.path}"
+        console.print(f"[green]Finished mock code generation for {len(final_code_outputs)} files.[/green]")
 
-    if use_mock_logic_for_tui_demo:
-        console.print("[italic yellow]Using mock logic for code generation loop (Ollama client not available or TUI demo forced).[/italic yellow]")
-        # Ensure file_list has mock data for TUI demo if it's empty
-        if not file_list.files:
-            file_list = FileList(files=[
-                FileDetail(path="mock/main.py", description="Mock main file"),
-                FileDetail(path="mock/utils.py", description="Mock utils file to demonstrate failure prompt"),
-                FileDetail(path="mock/README.md", description="Mock Readme")
-            ])
+    console.print("\n[bold green]Step 5: Generating Documentation... (condensed)[/bold green]")
+    if not final_code_outputs or not active_ollama_for_later_steps:
+        console.print("[yellow]Skipping Documentation (no code or no client).[/yellow]")
+    else:
+        console.print(f"[italic gray]Simulating documentation for {len(final_code_outputs)} files...[/italic gray]")
+        console.print("[green]Finished mock documentation generation.[/green]")
 
-        # Mock logic to demonstrate TUI for Step 4
-        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), BarColumn(), TextColumn("[progress.percentage]{task.percentage:>3.0f}%"), TimeElapsedColumn(), console=console, transient=False) as progress:
-            file_gen_task = progress.add_task("[cyan]File Generation (Mock Demo)", total=len(file_list.files))
-            for i, file_detail in enumerate(file_list.files): # Ensure this uses the potentially mocked file_list
-                progress.update(file_gen_task, description=f"Mock processing: {file_detail.path}")
-                time.sleep(0.2)
-                # Simulate one success, one failure for prompt, one more success
-                if file_detail.path == "mock/main.py":
-                     final_code_outputs[file_detail.path] = f"# Mock code for {file_detail.path}"
-                     progress.console.print(f"[green]✓ Mock code for {file_detail.path} 'passed'.[/green]")
-                elif file_detail.path == "mock/utils.py":
-                    progress.console.print(Panel(f"Mock failure for [bold]{file_detail.path}[/bold] after 3 attempts.", title="[red]Mock File Failed[/red]", expand=False))
-                    if console.is_interactive:
-                        choice = Prompt.ask(f"Action for [bold]{file_detail.path}[/bold]?", choices=["c","s","a"], default="c", console=console).lower()
-                        if choice == 's': progress.console.print(f"[yellow]Skipping {file_detail.path}.[/yellow]")
-                        elif choice == 'a': console.print("[bold red]Aborting (mock).[/bold red]"); return
-                elif file_detail.path == "mock/README.md":
-                     final_code_outputs[file_detail.path] = f"# Mock code for {file_detail.path}"
-                     progress.console.print(f"[green]✓ Mock code for {file_detail.path} 'passed'.[/green]")
-                progress.update(file_gen_task, advance=1)
-
-    elif not file_list.files: # If not using mock logic, and file list is still empty
-        console.print("[yellow]Skipping code generation: File list is empty.[/yellow]")
-
-    else: # Actual logic with Ollama client AND file_list is not empty
-        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), BarColumn(), TextColumn("[progress.percentage]{task.percentage:>3.0f}%"), TimeElapsedColumn(), console=console, transient=False) as progress:
-            file_gen_task = progress.add_task("[cyan]File Generation Progress", total=len(file_list.files))
-            for file_detail in file_list.files:
-                progress.update(file_gen_task, description=f"Processing: {file_detail.path}")
-                current_code = ""
-                feedback_history = []
-                file_processed_successfully = False
-                for retry_count in range(3):
-                    progress.console.print(f"[gray]Attempt {retry_count + 1}/3 for {file_detail.path}...[/gray]")
-                    try:
-                        # 1. CodingAgent
-                        coding_prompt_template = CODING_AGENT_PROMPT
-                        coding_prompt = coding_prompt_template.replace("[[FILE_PATH]]", file_detail.path) \
-                            .replace("[[FILE_DESCRIPTION]]", file_detail.description) \
-                            .replace("[[PROJECT_PLAN_CONTENT]]", project_plan.model_dump_json()) \
-                            .replace("[[EXISTING_CODE]]", current_code if current_code else "") \
-                            .replace("[[FEEDBACK]]", "\n".join(feedback_history[-2:]) if feedback_history else "No feedback yet.") \
-                            .replace("[[RELEVANT_FILES_CONTEXT]]", "") # Placeholder
-
-                        generated_code = ollama_client.generate(coding_prompt)
-                        if generated_code.startswith("Error:"):
-                            progress.console.print(f"[red]CodingAgent Error for {file_detail.path}: {generated_code}[/red]")
-                            feedback_history.append(f"CodingAgent Error: {generated_code}")
-                            if retry_count == 2: break # Failed all retries for this agent
-                            current_code = "" # Reset code on agent error
-                            continue
-
-                        # 2. SeniorEngineerAgent
-                        senior_prompt_template = SENIOR_ENGINEER_AGENT_PROMPT
-                        senior_prompt = senior_prompt_template.replace("[[FILE_PATH]]", file_detail.path) \
-                            .replace("[[FILE_DESCRIPTION]]", file_detail.description) \
-                            .replace("[[GENERATED_CODE]]", generated_code) \
-                            .replace("[[PROJECT_PLAN_CONTENT]]", project_plan.model_dump_json())
-
-                        raw_senior_review = ollama_client.generate(senior_prompt)
-                        senior_review_passed = False
-                        senior_feedback_text = f"Senior Engineer review failed to parse or returned an error for {file_detail.path}"
-                        senior_revised_code = None
-
-                        if raw_senior_review.startswith("Error:"):
-                            progress.console.print(f"[red]SeniorEngineerAgent Error for {file_detail.path}: {raw_senior_review}[/red]")
-                        else:
-                            try:
-                                sr_json_start = raw_senior_review.find('{'); sr_json_end = raw_senior_review.rfind('}') + 1
-                                if sr_json_start != -1 and sr_json_end > sr_json_start:
-                                    review_data = json.loads(raw_senior_review[sr_json_start:sr_json_end])
-                                    senior_review_passed = review_data.get("review_passed", False)
-                                    senior_feedback_text = review_data.get("feedback", "No specific feedback provided.")
-                                    senior_revised_code = review_data.get("revised_code")
-                                else:
-                                    progress.console.print(f"[red]SeniorEngineerAgent output for {file_detail.path} was not valid JSON.[/red]")
-                            except json.JSONDecodeError as e_sr_json:
-                                progress.console.print(f"[red]SeniorEngineerAgent JSON parsing error for {file_detail.path}: {e_sr_json}[/red]")
-                            except Exception as e_sr_val:
-                                progress.console.print(f"[red]SeniorEngineerAgent Pydantic/validation error for {file_detail.path}: {e_sr_val}[/red]")
-
-                        feedback_history.append(f"Senior Feedback: {senior_feedback_text}")
-                        code_to_verify = senior_revised_code if senior_revised_code and senior_revised_code.strip() else generated_code
-
-                        # 3. verify_code Tool
-                        language = "python" if file_detail.path.endswith(".py") else "generic"
-                        tool_review_result = verify_code(code_to_verify, file_detail.path, language=language)
-                        if tool_review_result.feedback:
-                            feedback_history.append(f"Tool Verification Feedback: {tool_review_result.feedback}")
-
-                        # 4. Decision
-                        if senior_review_passed and tool_review_result.passed:
-                            progress.console.print(f"[green]✓ Code for {file_detail.path} passed all checks.[/green]")
-                            if write_code_to_file(file_detail.path, code_to_verify):
-                                final_code_outputs[file_detail.path] = code_to_verify
-                            else:
-                                progress.console.print(f"[bold red]Failed to write {file_detail.path} to disk. This attempt will be marked as failed.[/bold red]")
-                                # Treat write failure as a cycle failure, could retry or mark file as failed.
-                                # For now, it just means this attempt didn't save.
-                                if retry_count == 2 : break # If write fails on last attempt, it's a fail for the file.
-                                continue # Try to regenerate.
-
-                            file_processed_successfully = True
-                            break # Exit retry loop for this file
-                        else:
-                            failed_checks = []
-                            if not senior_review_passed: failed_checks.append("Senior Review")
-                            if not tool_review_result.passed: failed_checks.append("Tool Verification")
-                            progress.console.print(f"[yellow]Attempt {retry_count+1} for {file_detail.path} failed ({', '.join(failed_checks)}). Retrying if attempts left.[/yellow]")
-                            current_code = tool_review_result.revised_code if tool_review_result.revised_code and tool_review_result.revised_code.strip() else \
-                                           senior_revised_code if senior_revised_code and senior_revised_code.strip() else \
-                                           generated_code
-
-                    except Exception as e_attempt:
-                        progress.console.print(f"[bold red]Exception during attempt {retry_count+1} for {file_detail.path}: {e_attempt}[/bold red]")
-                        feedback_history.append(f"Exception in attempt: {e_attempt}")
-                        if retry_count == 2: break # Failed all retries
-                        current_code = "" # Reset on major error for this attempt
-                        continue # To next attempt
-
-
-                if not file_processed_successfully:
-                    progress.console.print(Panel(f"Failed to generate/verify [bold]{file_detail.path}[/bold] after 3 attempts.", title="[red]File Processing Failed[/red]", border_style="red", expand=False))
-                    if console.is_interactive:
-                        choice = Prompt.ask(f"Action for [bold]{file_detail.path}[/bold]?", choices=["c","s","a"], default="c", console=console).lower()
-                        if choice == 's': progress.console.print(f"[yellow]Skipping file: {file_detail.path}[/yellow]")
-                        elif choice == 'a': console.print("[bold red]Aborting project generation by user choice.[/bold red]"); return
-                    else: progress.console.print(f"[yellow]Non-interactive: Continuing after failure of {file_detail.path}.[/yellow]")
-                progress.update(file_gen_task, advance=1)
-
-    # Step 5: Documentation Generation
-    console.print("\n[bold green]Step 5: Generating Documentation...[/bold green]")
-    # The `or True` part forces mock logic for TUI demo when ollama_client is None.
-    # Remove `or True` for actual LLM runs.
-    use_mock_logic_for_tui_demo_step5 = not ollama_client or True
-
-    if not final_code_outputs:
-        console.print("[yellow]No code successfully generated. Skipping documentation generation.[/yellow]")
-    elif use_mock_logic_for_tui_demo_step5:
-        console.print("[italic yellow]Using mock logic for documentation (Ollama client not available or mock forced).[/italic yellow]")
-        # Mock logic for Step 5
-        mock_doc_files = {"README.md": "# Mock Project\nThis is a mock README.", "docs/USAGE.md": "## How to Use\nRun the mock."}
-        if any(path.startswith("docs/") for path in mock_doc_files.keys()): create_docs_dir_if_not_exists()
-        with Progress(SpinnerColumn(),TextColumn("[progress.description]{task.description}"),BarColumn(),TimeElapsedColumn(),console=console,transient=False) as progress:
-            doc_task = progress.add_task("[cyan]Writing Docs (Mock)", total=len(mock_doc_files))
-            for path, content in mock_doc_files.items():
-                progress.update(doc_task, description=f"Mock writing: {path}")
-                write_code_to_file(path, content) # Use actual write tool
-                time.sleep(0.1)
-                progress.update(doc_task, advance=1)
-        console.print(f"[green]Mock documentation generated. {len(mock_doc_files)} file(s) processed.[/green]")
-    else: # Actual logic with Ollama client
-        try:
-            project_plan_json = project_plan.model_dump_json(indent=2)
-            file_list_json = file_list.model_dump_json(indent=2)
-            code_content_map_json = json.dumps(final_code_outputs, indent=2)
-            doc_prompt_template = DOCUMENTATION_AGENT_PROMPT
-            doc_prompt = doc_prompt_template.replace("[[PROJECT_PLAN_CONTENT]]", project_plan_json) \
-                .replace("[[FILE_LIST_JSON]]", file_list_json) \
-                .replace("[[FINAL_CODE_CONTENT_MAP]]", code_content_map_json)
-
-            console.print("[italic gray]Calling DocumentationAgent...[/italic gray]")
-            raw_doc_output = ollama_client.generate(doc_prompt)
-
-            if raw_doc_output.startswith("Error:"):
-                console.print(f"[red]DocumentationAgent Error: {raw_doc_output}[/red]")
-            else:
-                try:
-                    doc_json_start = raw_doc_output.find('{'); doc_json_end = raw_doc_output.rfind('}') + 1
-                    if doc_json_start != -1 and doc_json_end > doc_json_start:
-                        doc_files_map = json.loads(raw_doc_output[doc_json_start:doc_json_end])
-                        if doc_files_map:
-                            if any(path.startswith("docs/") for path in doc_files_map.keys()): create_docs_dir_if_not_exists()
-                            with Progress(SpinnerColumn(),TextColumn("[progress.description]{task.description}"),BarColumn(),TimeElapsedColumn(),console=console,transient=False) as progress:
-                                doc_write_task = progress.add_task("[cyan]Writing Documentation", total=len(doc_files_map))
-                                for doc_path, doc_content in doc_files_map.items():
-                                    progress.update(doc_write_task, description=f"Writing: {doc_path}")
-                                    if not write_code_to_file(doc_path, doc_content):
-                                        progress.console.print(f"[red]Failed to write documentation file: {doc_path}[/red]")
-                                    progress.update(doc_write_task, advance=1)
-                            console.print(f"[green]Documentation generation complete. {len(doc_files_map)} file(s) processed.[/green]")
-                        else: console.print("[yellow]DocumentationAgent returned no documentation files.[/yellow]")
-                    else: console.print("[red]Could not find valid JSON in DocumentationAgent output.[/red]")
-                except json.JSONDecodeError as e_doc_json:
-                    console.print(f"[red]Documentation JSON parsing error: {e_doc_json}[/red]")
-                except Exception as e_doc_val:
-                     console.print(f"[red]Documentation Pydantic/validation error: {e_doc_val}[/red]")
-        except Exception as e:
-            console.print(f"[bold red]Exception during Documentation Generation: {e}[/bold red]")
-
-    console.print("\n[bold blue]Project generation process complete.[/bold blue]")
+    console.print("\n[bold blue]Project generation process (ReAct demo focused) complete.[/bold blue]")
 
 if __name__ == "__main__":
-    sample_user_desc = "A simple CLI to-do app in Python, with basic file operations and a README."
-    console.print("[bold yellow]=== Agentic Coding System - Error Handling & Refinements Demo ===[/bold yellow]")
+    sample_user_desc = "Develop a Python library for advanced particle simulations using CUDA."
+    console.print("[bold yellow]=== Agentic Coding System - ReAct Pattern Demo ===[/bold yellow]")
     user_desc_input = sample_user_desc
-    if console.is_interactive:
-        response = Prompt.ask("Enter project description (or press Enter for sample)", default=sample_user_desc, console=console)
-        user_desc_input = response if response.strip() else sample_user_desc
+
+    MOCK_OLLAMA_TOOLS_ACTIVE = True
+
+    console.print(f"[italic gray]Forcing MOCK for demo. Using sample: '{user_desc_input}'[/italic gray]")
+
+    if MOCK_OLLAMA_TOOLS_ACTIVE:
+        console.print("[italic magenta]Using MOCK Ollama responses for this ReAct run.[/italic magenta]")
+        mock_client_instance = MockOllamaClientForTools()
+        mock_client_instance._user_desc_input_for_mock = user_desc_input
+        ollama_client = mock_client_instance
+    elif ollama_client is not None:
+        console.print("[italic green]Attempting to use REAL Ollama client for ReAct run.[/italic green]")
     else:
-        console.print(f"[italic gray]Non-interactive mode. Using sample description: '{user_desc_input}'[/italic gray]")
+        console.print("[bold red]Error: No client (real or mock) configured for ReAct. Exiting.[/bold red]")
+        exit()
+
     run_project(user_desc_input)

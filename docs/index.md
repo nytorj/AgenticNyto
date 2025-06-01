@@ -1,2 +1,2 @@
 # Mock Docs Index
-More details here.
+Details based on final code.
